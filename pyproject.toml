@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "build-talks"
+version = "1.0.0"
+description = "Assemble conference talk videos from source recordings."
+requires-python = ">=3.11"
+dependencies = [
+    "notion-client>=3.0.0",
+    "requests",
+    "python-dotenv",
+    "faster-whisper",
+]
+
+[project.scripts]
+build-talks = "build_talks.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/build_talks"]
