@@ -5,209 +5,372 @@ Whisper is loaded once per run and reused across all talks.
 Subtitles follow Netflix subtitle standards:
   - Max 2 lines per card
   - Max 42 characters per line
-  - Min 1.5s / Max 7s display duration
-  - Min 2-frame gap between captions
+  - Min 0.833s / Max 7s display duration
+  - Min 80 ms gap between captions
 """
 
 from __future__ import annotations
 
 import logging
-import re
+import subprocess
+import tempfile
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from faster_whisper import WhisperModel
 
 log = logging.getLogger(__name__)
 
 # ---- Netflix subtitle standards ----
 MAX_CHARS = 42
 MAX_LINES = 2
-MIN_DURATION = 1.5   # seconds
-MAX_DURATION = 7.0   # seconds
-MIN_GAP = 2 / 30     # 2 frames at 30 fps
+MIN_DURATION = 5 / 6     # 0.833s — 20 frames at 24 fps
+MAX_DURATION = 7.0       # seconds
+MIN_GAP = 0.080          # 80 ms minimum gap between subtitles
+PAUSE_BREAK = 0.300      # natural pause gap that warrants a subtitle break
+
+# Seconds between heartbeat log lines during transcription
+_PROGRESS_INTERVAL = 30
 
 
 def load_model(model_name: str) -> dict:
     """
     Load the Whisper model and return it in a context dict.
 
-    Loading is deferred until first call (not at import time) so that
-    --no-transcribe runs never pay the model-load cost.
+    Automatically selects the best available device:
+      - "cuda"  if a CUDA GPU is available
+      - "cpu"   otherwise (Apple Silicon included — CTranslate2 doesn't support MPS)
+
+    Uses BatchedInferencePipeline for parallel chunk processing, which gives a
+    significant speedup on multi-core CPUs (e.g. Apple Silicon) by processing
+    multiple VAD-segmented audio chunks simultaneously.
+
+    Returns a dict with keys:
+      "model":    the loaded WhisperModel (underlying model)
+      "pipeline": BatchedInferencePipeline wrapping the model
+      "name":     model name string
+      "device":   device string used
     """
     import os
-    from faster_whisper import WhisperModel
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
 
-    log.info("[whisper] loading model '%s'...", model_name)
-    device = "cpu"
-    # Use Metal (GPU) on Apple Silicon when Core ML support is available.
-    if os.uname().sysname == "Darwin":
-        try:
-            import coremltools  # noqa: F401
-            device = "auto"
-        except ImportError:
-            pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+            compute_type = "float16"
+            cpu_threads = 0  # not used on CUDA
+        else:
+            # CTranslate2 doesn't support MPS; use all available CPU cores on Apple Silicon
+            device = "cpu"
+            compute_type = "int8"
+            cpu_threads = os.cpu_count() or 4
+    except ImportError:
+        device = "cpu"
+        compute_type = "int8"
+        cpu_threads = os.cpu_count() or 4
 
-    model = WhisperModel(model_name, device=device, compute_type="int8")
-    log.info("[whisper] model ready")
-    return {"model": model, "model_name": model_name}
+    log.info(
+        "[pre-warm] loading faster-whisper model %s on %s (%d threads)...",
+        model_name, device, cpu_threads,
+    )
+    t0 = time.monotonic()
+    model = WhisperModel(
+        model_name,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=cpu_threads,
+    )
+    pipeline = BatchedInferencePipeline(model=model)
+    log.info("[pre-warm] faster-whisper ready (%.1fs)", time.monotonic() - t0)
+    return {"model": model, "pipeline": pipeline, "name": model_name, "device": device}
 
 
 def transcribe_talk(
     source: Path,
     start: str,
+    end: str,
     intro_offset: float,
     srt_path: Path,
     whisper_ctx: dict,
     language: str,
+    force: bool = False,
 ) -> None:
     """
-    Transcribe the talk audio from *source* and write an SRT file.
+    Transcribe the talk audio from *source* (trimmed to start/end) and write
+    Netflix-standard subtitles to *srt_path*.
 
-    Timestamps in the SRT are offset by *intro_offset* seconds so that
-    captions are aligned to the final assembled video, not to the raw source.
+    Pipeline:
+      1. Extract trimmed audio to a temporary 16 kHz mono WAV.
+      2. Transcribe with faster-whisper using VAD filtering and word timestamps.
+         VAD (Silero) automatically skips silent/pause regions so long pauses
+         never confuse the model or produce phantom text.
+      3. Collect word-level timestamps from the transcription segments directly
+         (no separate alignment pass needed — faster-whisper returns them natively).
+      4. Segment words into Netflix-standard subtitle cards via _words_to_subtitles().
+      5. Apply intro_offset so SRT timestamps align with the final rendered video.
+
+    Failures are logged but do not raise so the overall build pipeline continues.
 
     Args:
-        source:        Path to the source recording.
-        start:         HH:MM:SS[.mmm] timestamp of the talk start in source.
-        intro_offset:  Seconds to add to every subtitle timestamp
-                       (accounts for BLACK_PAD + title clip + sponsor clip).
-        srt_path:      Destination path for the generated .srt file.
-        whisper_ctx:   Context dict returned by load_model().
-        language:      BCP-47 language code (e.g. "en").
+        source:       Path to the source recording.
+        start:        HH:MM:SS[.mmm] start timestamp of the talk in the source file.
+        end:          HH:MM:SS[.mmm] end timestamp of the talk in the source file.
+        intro_offset: Seconds to add to every subtitle timestamp
+                      (accounts for BLACK_PAD + title clip + sponsor clip).
+        srt_path:     Destination path for the generated .srt file.
+        whisper_ctx:  Context dict returned by load_model().
+        language:     BCP-47 language code (e.g. "en").
+        force:        If True, overwrite an existing SRT file.
     """
-    from faster_whisper import WhisperModel
-
-    if srt_path.exists():
-        log.debug("[whisper] %s — SRT already exists, skipping", srt_path.name)
+    if srt_path.exists() and not force:
+        log.debug("[transcribing] %s — SRT already exists, skipping", srt_path.name)
         return
 
-    model: WhisperModel = whisper_ctx["model"]
+    try:
+        # Compute talk duration for logging
+        h, m, s_str = start.split(":")
+        start_s = int(h) * 3600 + int(m) * 60 + float(s_str)
+        h2, m2, s2_str = end.split(":")
+        end_s = int(h2) * 3600 + int(m2) * 60 + float(s2_str)
+        audio_dur = end_s - start_s
 
-    # Convert HH:MM:SS.mmm → seconds for faster-whisper's offset argument.
-    h, m, s_str = start.split(":")
-    start_s = int(h) * 3600 + int(m) * 60 + float(s_str)
+        log.info("[transcribing] %s — %.0fs audio", srt_path.stem, audio_dur)
 
-    log.info("[whisper] transcribing %s...", source.name)
-    segments_iter, _ = model.transcribe(
-        str(source),
-        language=language,
-        word_timestamps=True,
-        beam_size=1,          # greedy; matches distil-model training regime
-        vad_filter=True,
-        initial_prompt=(
-            "Conference talk. Technical content. "
-            "Use correct punctuation and capitalisation."
-        ),
-        clip_timestamps=[start_s],
-    )
-    segments = list(segments_iter)
-    log.info("[whisper] transcription done — %d segment(s)", len(segments))
+        # ---- 1. Extract trimmed audio to a temp WAV ----
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
 
-    words = _collect_words(segments, start_s, intro_offset)
-    subtitles = _words_to_subtitles(words)
-    _write_srt(subtitles, srt_path)
-    log.info("[whisper] wrote %s (%d cue(s))", srt_path.name, len(subtitles))
+        try:
+            # Compute duration string HH:MM:SS.mmm for ffmpeg -t
+            total_s = audio_dur
+            dur_h = int(total_s // 3600)
+            dur_m = int((total_s % 3600) // 60)
+            dur_s = total_s % 60
+            duration_str = f"{dur_h}:{dur_m:02d}:{dur_s:06.3f}"
 
-
-def _collect_words(
-    segments: list,
-    start_s: float,
-    intro_offset: float,
-) -> list[dict]:
-    """
-    Flatten segment words into a list, trimming to the talk window and
-    shifting timestamps so they're relative to the final video.
-    """
-    words = []
-    for seg in segments:
-        if not seg.words:
-            continue
-        for w in seg.words:
-            if w.start < start_s:
-                continue
-            words.append(
-                {
-                    "word": w.word,
-                    "start": w.start - start_s + intro_offset,
-                    "end": w.end - start_s + intro_offset,
-                }
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", start,
+                    "-t", duration_str,
+                    "-i", str(source),
+                    "-vn", "-ar", "16000", "-ac", "1",
+                    str(tmp_path),
+                ],
+                check=True,
+                capture_output=True,
             )
-    return words
+
+            fw_pipeline = whisper_ctx["pipeline"]
+            t0 = time.monotonic()
+
+            # ---- 2. Transcribe with BatchedInferencePipeline + VAD + word timestamps ----
+            # BatchedInferencePipeline processes multiple VAD-segmented audio chunks
+            # in parallel (batch_size=16), giving a large speedup on multi-core CPUs
+            # like Apple Silicon (where CTranslate2 can't use MPS/GPU).
+            #
+            # beam_size=1 with temperature=0.0 is pure greedy decoding — identical
+            # quality to beam_size=5 for English conference talks but ~3-5x faster
+            # since the model only explores one hypothesis at a time.
+            #
+            # VAD parameters tuned for conference talks:
+            # - speech_pad_ms: keep 200 ms of audio around detected speech
+            #   so sentence-final words are never clipped.
+            # - min_silence_duration_ms: a pause must be ≥ 300 ms before VAD
+            #   considers it a segment boundary.
+            segments_iter, _info = fw_pipeline.transcribe(
+                str(tmp_path),
+                language=language,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters={
+                    "speech_pad_ms": 200,
+                    "min_silence_duration_ms": 300,
+                },
+                batch_size=16,
+                beam_size=1,
+                temperature=0.0,
+                condition_on_previous_text=True,
+                no_speech_threshold=0.6,
+                log_prob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+            )
+
+            # BatchedInferencePipeline processes audio in large batches internally
+            # and emits segments in bulk — per-segment progress tracking is
+            # meaningless. Log a heartbeat every _PROGRESS_INTERVAL seconds so the
+            # user knows the process hasn't hung.
+            segments: list = []
+            t_last_log = t0
+
+            def _heartbeat_log() -> None:
+                now = time.monotonic()
+                nonlocal t_last_log
+                if now - t_last_log >= _PROGRESS_INTERVAL:
+                    wall = int(now - t0)
+                    log.info("[transcribing] %s — working... (%ds)", srt_path.stem, wall)
+                    t_last_log = now
+
+            for seg in segments_iter:
+                segments.append(seg)
+                _heartbeat_log()
+
+            elapsed_total = time.monotonic() - t0
+            log.info("[transcribing] %s — done (%.0fs)", srt_path.stem, elapsed_total)
+
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        # ---- 3. Collect word-level timestamps ----
+        # Words are relative to the start of the trimmed WAV (i.e. start at 0),
+        # so we only need to add intro_offset to align with the final video.
+        words: list[dict] = []
+        for seg in segments:
+            for w in (seg.words or []):
+                words.append({
+                    "word": w.word,
+                    "start": w.start + intro_offset,
+                    "end": w.end + intro_offset,
+                })
+
+        # ---- 4. Segment into Netflix-standard subtitle cards ----
+        final_segments = _words_to_subtitles(words)
+
+        # ---- 5. Write SRT ----
+        _write_srt(final_segments, srt_path)
+        log.info(
+            "[transcribing] %s — wrote %d subtitles → %s",
+            srt_path.stem, len(final_segments), srt_path,
+        )
+
+    except Exception as exc:
+        log.error("[transcribing] %s — failed: %s", srt_path.stem, exc)
 
 
-def _words_to_subtitles(words: list[dict]) -> list[dict]:
+def _words_to_subtitles(words: list[dict]) -> list[tuple[float, float, str]]:
     """
-    Pack words into subtitle cues following Netflix standards.
+    Convert a flat list of word-timestamp dicts into subtitle segments that
+    comply with Netflix Timed Text style constraints:
 
-    Each cue contains at most MAX_LINES lines of MAX_CHARS characters.
-    Cue duration is clamped to [MIN_DURATION, MAX_DURATION].
-    A MIN_GAP gap is enforced between consecutive cues.
+      - Max MAX_CHARS characters per line
+      - Max MAX_LINES lines per card (2)
+      - Min MIN_DURATION seconds duration
+      - Max MAX_DURATION seconds duration
+      - Min MIN_GAP seconds gap between consecutive subtitles
+      - Break at natural pauses >= PAUSE_BREAK seconds between words
+
+    Each word dict must have "word", "start", and "end" keys.
+    Words missing timing data are skipped.
+
+    Returns a list of (start_s, end_s, text) tuples ready for _write_srt().
     """
+    segments: list[tuple[float, float, str]] = []
     if not words:
-        return []
+        return segments
 
-    cues: list[dict] = []
-    line: list[str] = []
-    lines: list[str] = []
-    cue_start: float = words[0]["start"]
-    last_end = 0.0
+    line1: list[str] = []
+    line2: list[str] = []
+    seg_start: float | None = None
+    seg_end: float | None = None
+    prev_end: float | None = None
 
-    def flush(end: float) -> None:
-        nonlocal line, lines, cue_start, last_end
-        if lines or line:
-            if line:
-                lines.append(" ".join(line))
-            text = "\n".join(lines)
-            start = max(cue_start, last_end + MIN_GAP)
-            dur = min(max(end - start, MIN_DURATION), MAX_DURATION)
-            cues.append({"start": start, "end": start + dur, "text": text})
-            last_end = start + dur
-        line = []
-        lines = []
+    def _flush() -> None:
+        nonlocal line1, line2, seg_start, seg_end, prev_end
+        if seg_start is None or not line1:
+            return
+        text = " ".join(line1)
+        if line2:
+            text += "\n" + " ".join(line2)
+
+        start = seg_start
+        end = seg_end or seg_start
+
+        # Enforce minimum duration
+        if end - start < MIN_DURATION:
+            end = start + MIN_DURATION
+
+        # Enforce minimum gap from the previous subtitle's end
+        if segments:
+            prev_sub_end = segments[-1][1]
+            if start < prev_sub_end + MIN_GAP:
+                start = prev_sub_end + MIN_GAP
+                if end <= start:
+                    end = start + MIN_DURATION
+
+        segments.append((start, end, text))
+        line1 = []
+        line2 = []
+        seg_start = None
+        seg_end = None
 
     for w in words:
-        token = w["word"].strip()
-        if not token:
+        word_text = w.get("word", "").strip()
+        w_start = w.get("start")
+        w_end = w.get("end")
+        if not word_text or w_start is None or w_end is None:
             continue
 
-        candidate = " ".join(line + [token]) if line else token
-        if len(candidate) > MAX_CHARS:
-            if len(lines) >= MAX_LINES - 1:
-                # Current cue is full — flush and start a new one.
-                flush(w["start"])
-                cue_start = w["start"]
-            else:
-                # Move to the next line within this cue.
-                lines.append(" ".join(line))
-            line = [token]
+        # Natural pause — flush current card and start fresh
+        if prev_end is not None and (w_start - prev_end) >= PAUSE_BREAK:
+            _flush()
+
+        # Sentence boundary on previous word — flush at clean break
+        if seg_end is not None and line1 and not line2:
+            last_word = line1[-1]
+            if last_word and last_word[-1] in ".!?":
+                _flush()
+
+        # Start a new card if needed
+        if seg_start is None:
+            seg_start = w_start
+
+        # Try to place word on current line
+        target_line = line2 if line2 else line1
+        candidate = (" ".join(target_line) + " " + word_text).strip()
+
+        if len(candidate) <= MAX_CHARS:
+            target_line.append(word_text)
+        elif not line2 and len(word_text) <= MAX_CHARS:
+            # Word doesn't fit on line 1 — move to line 2
+            line2.append(word_text)
         else:
-            line.append(token)
+            # Both lines full — flush and start a new card with this word
+            _flush()
+            seg_start = w_start
+            line1.append(word_text)
 
-    # Flush the final cue using the last word's end time.
-    if words:
-        flush(words[-1]["end"])
+        seg_end = w_end
+        prev_end = w_end
 
-    return cues
+        # Duration cap — flush if this card is getting too long
+        if seg_start is not None and (w_end - seg_start) >= MAX_DURATION:
+            _flush()
+
+    _flush()  # emit any remaining words
+    return segments
 
 
 def _srt_timestamp(seconds: float) -> str:
-    """Convert a float number of seconds to SRT HH:MM:SS,mmm format."""
+    """Convert fractional seconds to SRT timestamp format HH:MM:SS,mmm."""
     ms = int(round(seconds * 1000))
-    h, ms = divmod(ms, 3_600_000)
-    m, ms = divmod(ms, 60_000)
-    s, ms = divmod(ms, 1_000)
+    h = ms // 3_600_000
+    ms %= 3_600_000
+    m = ms // 60_000
+    ms %= 60_000
+    s = ms // 1000
+    ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def _write_srt(cues: list[dict], path: Path) -> None:
-    """Write a list of cue dicts to an SRT file."""
+def _write_srt(segments: list[tuple[float, float, str]], path: Path) -> None:
+    """Write a list of (start_s, end_s, text) tuples as an SRT file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
-        for i, cue in enumerate(cues, start=1):
-            fh.write(
-                f"{i}\n"
-                f"{_srt_timestamp(cue['start'])} --> {_srt_timestamp(cue['end'])}\n"
-                f"{cue['text']}\n\n"
-            )
+        idx = 1
+        for start, end, text in segments:
+            text = text.strip()
+            if not text:
+                continue
+            fh.write(f"{idx}\n")
+            fh.write(f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n")
+            fh.write(f"{text}\n\n")
+            idx += 1

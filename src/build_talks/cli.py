@@ -131,11 +131,14 @@ def process_talk(row: dict, cfg: Config, sponsor_normalized: Path, intro_offset:
     transcribe_thread: threading.Thread | None = None
     if whisper_ctx is not None:
         srt_path = cfg.output / f"{talk_id}.srt"
-        transcribe_thread = threading.Thread(
-            target=transcribe_talk,
-            args=(source, start, intro_offset, srt_path, whisper_ctx, cfg.whisper_language),
-        )
-        transcribe_thread.start()
+        if not srt_path.exists() or cfg.force:
+            transcribe_thread = threading.Thread(
+                target=transcribe_talk,
+                args=(source, start, end, intro_offset, srt_path, whisper_ctx, cfg.whisper_language, cfg.force),
+            )
+            transcribe_thread.start()
+        else:
+            log.info("[skip] %s — SRT already exists", talk_id)
 
     # --- Render title card clip, then the full assembled video ---
     render_title_card(title_image, title_video, cfg.vcodec, label=talk_id)
@@ -199,7 +202,12 @@ def main() -> int:
 
     # ---- Logging ----
     level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s", stream=sys.stderr)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stderr,
+    )
     ff.verbose = args.verbose
 
     vcodec = VCODEC_SW if args.software_encode else VCODEC_HW
