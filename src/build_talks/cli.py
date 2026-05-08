@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -24,11 +25,14 @@ from build_talks.config import (
     BLACK_PAD,
     TITLE_DURATION,
     FADE_DURATION,
+    SPONSOR_HOLD,
     Config,
 )
-from build_talks import ffmpeg as ff
+from build_talks import ffmpeg
+from build_talks.ffmpeg import ts_to_us
 from build_talks.notion import NotionFetcher
-from build_talks.render import normalize_sponsor, render_full_talk, render_title_card, ts_to_us
+from build_talks.render import assemble
+from build_talks.segment import BLACK, Segment, talk_offset
 from build_talks.transcribe import load_model, transcribe_talk
 
 log = logging.getLogger(__name__)
@@ -78,7 +82,7 @@ def validate_row(row: dict, row_num: int) -> list[str]:
 
 # ---- Per-talk pipeline ----
 
-def process_talk(row: dict, cfg: Config, sponsor_normalized: Path, intro_offset: float, whisper_ctx: dict | None) -> None:
+def process_talk(row: dict, cfg: Config, whisper_ctx: dict | None) -> None:
     """
     Build one talk video end-to-end.
 
@@ -86,9 +90,10 @@ def process_talk(row: dict, cfg: Config, sponsor_normalized: Path, intro_offset:
       1. Resolve paths and skip if output already exists (unless --force).
       2. Validate the talk's duration is long enough for the fade bookends.
       3. Find the cached title card image.
-      4. Kick off transcription in a background thread.
-      5. Render the title card clip and the full assembled video.
-      6. Wait for transcription to finish.
+      4. Build the segment recipe.
+      5. Compute the talk audio offset, then start transcription in parallel.
+      6. Render the full video via assemble().
+      7. Join the transcription thread.
     """
     talk_id = row["id"].strip()
     source = Path(row["source_file"].strip())
@@ -97,7 +102,6 @@ def process_talk(row: dict, cfg: Config, sponsor_normalized: Path, intro_offset:
 
     output = cfg.output / f"{talk_id}.mp4"
     titles_dir = cfg.cache / "titles"
-    title_video = titles_dir / f"{talk_id}.mp4"
 
     if output.exists() and not cfg.force:
         log.info("[skip] %s — already built", talk_id)
@@ -125,35 +129,40 @@ def process_talk(row: dict, cfg: Config, sponsor_normalized: Path, intro_offset:
         raise FileNotFoundError(f"No title card image found in {titles_dir} for '{talk_id}'")
     title_image = title_images[0]
 
-    sponsor_dur_us = ff.probe_duration_us(sponsor_normalized)
+    # --- Build the segment recipe ---
+    # The title card and sponsor use pad_start/pad_end to provide xfade headroom.
+    # The talk is raw — it is normalised inside the final filtergraph.
+    recipe = [
+        Segment(source=BLACK, pad_start=BLACK_PAD + FADE_DURATION, audio="silence"),
+        Segment(source=title_image, pad_start=TITLE_DURATION + 2 * FADE_DURATION, audio="silence"),
+        Segment(source=cfg.sponsor, pad_start=FADE_DURATION, pad_end=SPONSOR_HOLD + FADE_DURATION, audio="silence"),
+        Segment(source=source, trim_start=start, trim_end=end, audio="source", raw=True),
+        Segment(source=cfg.sponsor, pad_start=FADE_DURATION, pad_end=SPONSOR_HOLD + FADE_DURATION, audio="silence"),
+        Segment(source=BLACK, pad_end=BLACK_PAD + FADE_DURATION, audio="silence"),
+    ]
 
-    # --- Kick off transcription concurrently with rendering ---
+    # --- Compute talk audio offset (cheap — reads cached segment durations) ---
+    offset = talk_offset(recipe, cfg.cache, cfg.vcodec)
+
+    # --- Start transcription in parallel with rendering ---
+    # Transcription works directly from the source file and only needs the
+    # offset for subtitle timestamp alignment — it does not need the rendered video.
     transcribe_thread: threading.Thread | None = None
     if whisper_ctx is not None:
         srt_path = cfg.output / f"{talk_id}.srt"
         if not srt_path.exists() or cfg.force:
             transcribe_thread = threading.Thread(
                 target=transcribe_talk,
-                args=(source, start, end, intro_offset, srt_path, whisper_ctx, cfg.whisper_language, cfg.force),
+                args=(source, start, end, offset, srt_path, whisper_ctx, cfg.whisper_language, cfg.force),
             )
             transcribe_thread.start()
         else:
             log.info("[skip] %s — SRT already exists", talk_id)
 
-    # --- Render title card clip, then the full assembled video ---
-    render_title_card(title_image, title_video, cfg.vcodec, label=talk_id)
-    render_full_talk(
-        title_video,
-        sponsor_normalized,
-        source,
-        start,
-        end,
-        output,
-        cfg.vcodec,
-        sponsor_dur_us,
-    )
+    # --- Render the full video ---
+    assemble(recipe, output, cfg.vcodec, cfg.cache)
 
-    # --- Wait for transcription before returning ---
+    # --- Wait for transcription to finish ---
     if transcribe_thread is not None:
         transcribe_thread.join()
 
@@ -208,7 +217,7 @@ def main() -> int:
         datefmt="%H:%M:%S",
         stream=sys.stderr,
     )
-    ff.verbose = args.verbose
+    ffmpeg.verbose = args.verbose
 
     vcodec = VCODEC_SW if args.software_encode else VCODEC_HW
     log.info("[encoder] %s", vcodec)
@@ -270,7 +279,6 @@ def main() -> int:
     # ---- Set up Notion client ----
     fetcher: NotionFetcher | None = None
     if not cfg.no_notion:
-        import os
         token = os.getenv("NOTION_TOKEN")
         db_id = os.getenv("NOTION_CONFTALKS_DB_ID")
         if not token or not db_id:
@@ -332,25 +340,10 @@ def main() -> int:
         else:
             log.info("[notion] all %d title card(s) ready", len(rows))
 
-    # ---- Normalize sponsor reel ----
-    sponsor_normalized = cfg.cache / "sponsor.mp4"
-    if not cfg.dry_run:
-        normalize_sponsor(cfg.sponsor, sponsor_normalized, cfg.vcodec)
-
     # ---- Pre-warm Whisper model once before the main loop ----
     whisper_ctx: dict | None = None
     if not cfg.no_transcribe and not cfg.dry_run:
         whisper_ctx = load_model(cfg.whisper_model)
-
-    # ---- Compute subtitle intro offset (same for all talks in this run) ----
-    # intro_offset = how far into the final video the talk audio begins:
-    #   BLACK_PAD + title_clip + sponsor_clip - 2*FADE
-    # Since title_clip = TITLE_DURATION + 2*FADE and sponsor_clip = S,
-    # this simplifies to: BLACK_PAD + TITLE_DURATION + S
-    sponsor_dur_s = 0.0
-    if not cfg.dry_run:
-        sponsor_dur_s = ff.probe_duration_us(sponsor_normalized) / 1_000_000
-    intro_offset = BLACK_PAD + TITLE_DURATION + sponsor_dur_s
 
     # ---- Main processing loop ----
     total = len(rows)
@@ -361,7 +354,7 @@ def main() -> int:
         talk_id = row["id"].strip()
         log.info("[%d/%d] %s", idx, total, talk_id)
         try:
-            process_talk(row, cfg, sponsor_normalized, intro_offset, whisper_ctx)
+            process_talk(row, cfg, whisper_ctx)
         except Exception as exc:
             log.error("[error] %s — %s", talk_id, exc)
             failed.append(talk_id)

@@ -1,8 +1,18 @@
 """
-ffmpeg subprocess helpers.
+Low-level ffmpeg / ffprobe subprocess helpers.
 
-All direct ffmpeg/ffprobe invocations live here so the rest of the
-codebase never calls subprocess directly.
+Everything here is agnostic to the talk pipeline — it just knows how to
+talk to ffmpeg binaries.
+
+  verbose           -- module-level flag; set True to stream ffmpeg stderr live
+  PROGRESS_INTERVAL -- seconds between progress log lines during a long encode
+  probe_duration_us -- duration of a media file in microseconds
+  normalize_video_filter -- canonical scale+pad+fps filter string
+  vcodec_flags      -- encoder CLI flags for the chosen codec
+  anullsrc          -- silent audio lavfi source expression
+  run               -- execute an ffmpeg command, optionally logging progress
+  ts_to_us          -- HH:MM:SS[.mmm] → microseconds
+  duration_str      -- timestamp pair → HH:MM:SS.mmm duration string for -t
 """
 
 from __future__ import annotations
@@ -69,6 +79,14 @@ def vcodec_flags(vcodec: str) -> list[str]:
         return ["-c:v", VCODEC_HW, "-q:v", "65"]
     # libx264 constant-rate-factor: allocates bits where needed.
     return ["-c:v", VCODEC_SW, "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium"]
+
+
+def anullsrc(duration: float) -> str:
+    """Return an ffmpeg anullsrc filter expression trimmed to *duration* seconds."""
+    return (
+        f"anullsrc=channel_layout=stereo:sample_rate={SAMPLE_RATE},"
+        f"atrim=end={duration},asetpts=PTS-STARTPTS"
+    )
 
 
 def run(cmd: list[str], label: str = "", duration_us: int | None = None) -> None:
@@ -139,9 +157,20 @@ def run(cmd: list[str], label: str = "", duration_us: int | None = None) -> None
         raise RuntimeError(f"ffmpeg failed (exit {result.returncode})")
 
 
-def anullsrc(duration: float) -> str:
-    """Return an ffmpeg anullsrc filter expression trimmed to *duration* seconds."""
-    return (
-        f"anullsrc=channel_layout=stereo:sample_rate={SAMPLE_RATE},"
-        f"atrim=end={duration},asetpts=PTS-STARTPTS"
-    )
+def ts_to_us(ts: str) -> int:
+    """Convert HH:MM:SS[.mmm] timestamp to microseconds."""
+    h, m, s = ts.split(":")
+    return int((int(h) * 3600 + int(m) * 60 + float(s)) * 1_000_000)
+
+
+def duration_str(start: str, end: str) -> str:
+    """
+    Return the duration between two HH:MM:SS[.mmm] timestamps as an
+    HH:MM:SS.mmm string suitable for ffmpeg's -t option.
+    """
+    us = ts_to_us(end) - ts_to_us(start)
+    total_s = us / 1_000_000
+    h = int(total_s // 3600)
+    m = int((total_s % 3600) // 60)
+    s = total_s % 60
+    return f"{h}:{m:02d}:{s:06.3f}"
