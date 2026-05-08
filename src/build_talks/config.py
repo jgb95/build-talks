@@ -64,5 +64,6 @@ class Config:
     dry_run: bool
     verbose: bool
     no_transcribe: bool
+    no_subtitles: bool
     whisper_model: str
     whisper_language: str

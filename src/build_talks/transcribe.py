@@ -89,41 +89,43 @@ def transcribe_talk(
     start: str,
     end: str,
     intro_offset: float,
-    srt_path: Path,
+    words_path: Path,
     whisper_ctx: dict,
     language: str,
     force: bool = False,
-) -> None:
+) -> list[dict] | None:
     """
     Transcribe the talk audio from *source* (trimmed to start/end) and write
-    Netflix-standard subtitles to *srt_path*.
+    a word-level SRT to *words_path*.
+
+    The word-level SRT is the primary Whisper artifact — one subtitle entry per
+    word, with raw timestamps offset by *intro_offset* to align with the final
+    rendered video.  The formatted (Netflix-standard) subtitle file is derived
+    from this data by the caller via _words_to_subtitles() + _write_srt(); it
+    does not need Whisper at all if *words_path* already exists on disk.
 
     Pipeline:
       1. Extract trimmed audio to a temporary 16 kHz mono WAV.
       2. Transcribe with faster-whisper using VAD filtering and word timestamps.
-         VAD (Silero) automatically skips silent/pause regions so long pauses
-         never confuse the model or produce phantom text.
-      3. Collect word-level timestamps from the transcription segments directly
-         (no separate alignment pass needed — faster-whisper returns them natively).
-      4. Segment words into Netflix-standard subtitle cards via _words_to_subtitles().
-      5. Apply intro_offset so SRT timestamps align with the final rendered video.
+      3. Collect word-level timestamps and apply intro_offset.
+      4. Write word-level SRT to *words_path*.
 
+    Returns the list of word dicts on success, or None on failure.
     Failures are logged but do not raise so the overall build pipeline continues.
 
     Args:
         source:       Path to the source recording.
         start:        HH:MM:SS[.mmm] start timestamp of the talk in the source file.
         end:          HH:MM:SS[.mmm] end timestamp of the talk in the source file.
-        intro_offset: Seconds to add to every subtitle timestamp
-                      (accounts for BLACK_PAD + title clip + sponsor clip).
-        srt_path:     Destination path for the generated .srt file.
+        intro_offset: Seconds to add to every timestamp (accounts for title/sponsor clips).
+        words_path:   Destination path for the word-level .srt file.
         whisper_ctx:  Context dict returned by load_model().
         language:     BCP-47 language code (e.g. "en").
-        force:        If True, overwrite an existing SRT file.
+        force:        If True, overwrite an existing file.
     """
-    if srt_path.exists() and not force:
-        log.debug("[transcribing] %s — SRT already exists, skipping", srt_path.name)
-        return
+    if words_path.exists() and not force:
+        log.debug("[transcribing] %s — words SRT already exists, skipping Whisper", words_path.stem)
+        return None  # signal: use cached file instead
 
     try:
         # Compute talk duration for logging
@@ -133,7 +135,7 @@ def transcribe_talk(
         end_s = int(h2) * 3600 + int(m2) * 60 + float(s2_str)
         audio_dur = end_s - start_s
 
-        log.info("[transcribing] %s — %.0fs audio", srt_path.stem, audio_dur)
+        log.info("[transcribing] %s — %.0fs audio", words_path.stem, audio_dur)
 
         # ---- 1. Extract trimmed audio to a temp WAV ----
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -207,7 +209,7 @@ def transcribe_talk(
                 nonlocal t_last_log
                 if now - t_last_log >= _PROGRESS_INTERVAL:
                     wall = int(now - t0)
-                    log.info("[transcribing] %s — working... (%ds)", srt_path.stem, wall)
+                    log.info("[transcribing] %s — working... (%ds)", words_path.stem, wall)
                     t_last_log = now
 
             for seg in segments_iter:
@@ -215,7 +217,7 @@ def transcribe_talk(
                 _heartbeat_log()
 
             elapsed_total = time.monotonic() - t0
-            log.info("[transcribing] %s — done (%.0fs)", srt_path.stem, elapsed_total)
+            log.info("[transcribing] %s — done (%.0fs)", words_path.stem, elapsed_total)
 
         finally:
             tmp_path.unlink(missing_ok=True)
@@ -232,18 +234,17 @@ def transcribe_talk(
                     "end": w.end + intro_offset,
                 })
 
-        # ---- 4. Segment into Netflix-standard subtitle cards ----
-        final_segments = _words_to_subtitles(words)
-
-        # ---- 5. Write SRT ----
-        _write_srt(final_segments, srt_path)
+        # ---- 4. Write word-level SRT ----
+        _write_word_srt(words, words_path)
         log.info(
-            "[transcribing] %s — wrote %d subtitles → %s",
-            srt_path.stem, len(final_segments), srt_path,
+            "[transcribing] %s — wrote %d words → %s",
+            words_path.stem, len(words), words_path,
         )
+        return words
 
     except Exception as exc:
-        log.error("[transcribing] %s — failed: %s", srt_path.stem, exc)
+        log.error("[transcribing] %s — failed: %s", words_path.stem, exc)
+        return None
 
 
 def _words_to_subtitles(words: list[dict]) -> list[tuple[float, float, str]]:
@@ -374,3 +375,65 @@ def _write_srt(segments: list[tuple[float, float, str]], path: Path) -> None:
             fh.write(f"{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n")
             fh.write(f"{text}\n\n")
             idx += 1
+
+
+def _write_word_srt(words: list[dict], path: Path) -> None:
+    """
+    Write a word-level SRT file — one subtitle entry per word.
+
+    Each word uses its raw Whisper start/end timestamps (already offset-adjusted).
+    Words missing text or timing are skipped.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        idx = 1
+        for w in words:
+            text = w.get("word", "").strip()
+            w_start = w.get("start")
+            w_end = w.get("end")
+            if not text or w_start is None or w_end is None:
+                continue
+            fh.write(f"{idx}\n")
+            fh.write(f"{_srt_timestamp(w_start)} --> {_srt_timestamp(w_end)}\n")
+            fh.write(f"{text}\n\n")
+            idx += 1
+
+
+def _parse_word_srt(path: Path) -> list[dict]:
+    """
+    Read a word-level SRT file (written by _write_word_srt) back into the same
+    ``[{"word": str, "start": float, "end": float}]`` format that transcribe_talk()
+    returns.  This lets the caller derive the Netflix-standard subs from a cached
+    .words.srt without re-running Whisper.
+
+    SRT timestamp format: HH:MM:SS,mmm
+    Malformed entries are silently skipped.
+    """
+    words: list[dict] = []
+    if not path.exists():
+        return words
+
+    def _ts_to_sec(ts: str) -> float:
+        """Parse HH:MM:SS,mmm → float seconds."""
+        ts = ts.replace(",", ".")
+        h, m, s = ts.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    text = path.read_text(encoding="utf-8")
+    # SRT blocks are separated by blank lines; each block is: index\ntimecodes\ntext
+    for block in text.strip().split("\n\n"):
+        lines = [ln.strip() for ln in block.strip().splitlines()]
+        if len(lines) < 3:
+            continue
+        try:
+            # lines[0] = index (ignored), lines[1] = timecodes, lines[2] = word
+            start_str, end_str = lines[1].split(" --> ")
+            words.append({
+                "word": lines[2],
+                "start": _ts_to_sec(start_str.strip()),
+                "end": _ts_to_sec(end_str.strip()),
+            })
+        except (ValueError, IndexError):
+            continue
+
+    return words

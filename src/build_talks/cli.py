@@ -33,7 +33,10 @@ from build_talks.ffmpeg import ts_to_us
 from build_talks.notion import NotionFetcher
 from build_talks.render import assemble
 from build_talks.segment import BLACK, Segment, talk_offset
-from build_talks.transcribe import load_model, transcribe_talk
+from build_talks.transcribe import (
+    load_model, transcribe_talk,
+    _parse_word_srt, _words_to_subtitles, _write_srt,
+)
 
 log = logging.getLogger(__name__)
 
@@ -84,31 +87,58 @@ def validate_row(row: dict, row_num: int) -> list[str]:
 
 def process_talk(row: dict, cfg: Config, whisper_ctx: dict | None) -> None:
     """
-    Build one talk video end-to-end.
+    Build one talk video end-to-end, filling in only the outputs that are missing.
+
+    Outputs (both produced by default when transcription is enabled):
+      - <id>.mp4        — the rendered video
+      - <id>.words.srt  — word-level SRT (raw Whisper artifact; the cache key)
+      - <id>.subs.srt   — Netflix-standard subtitle SRT (derived from words)
+
+    Cache strategy:
+      Each output is checked independently.  If .words.srt already exists,
+      Whisper is skipped entirely and .subs.srt is derived by reading the cached
+      words file — making re-runs with subtitle tweaks extremely fast.
 
     Steps:
-      1. Resolve paths and skip if output already exists (unless --force).
-      2. Validate the talk's duration is long enough for the fade bookends.
-      3. Find the cached title card image.
+      1. Determine which outputs are needed.
+      2. Skip entirely if all outputs are already present.
+      3. Validate talk duration and find the title card image.
       4. Build the segment recipe.
-      5. Compute the talk audio offset, then start transcription in parallel.
-      6. Render the full video via assemble().
-      7. Join the transcription thread.
+      5. If words are needed, compute audio offset and run transcription in a thread.
+      6. If subs are needed but words are cached, derive them from the words file.
+      7. Render the video if needed.
+      8. Join the transcription thread.
     """
     talk_id = row["id"].strip()
     source = Path(row["source_file"].strip())
     start = row["start_time"].strip()
     end = row["end_time"].strip()
 
-    output = cfg.output / f"{talk_id}.mp4"
+    output    = cfg.output / f"{talk_id}.mp4"
+    words_path = cfg.output / f"{talk_id}.words.srt"
+    subs_path  = cfg.output / f"{talk_id}.subs.srt"
     titles_dir = cfg.cache / "titles"
 
-    if output.exists() and not cfg.force:
-        log.info("[skip] %s — already built", talk_id)
+    transcribe = whisper_ctx is not None
+
+    # --- Determine what still needs to be built ---
+    need_video = not output.exists() or cfg.force
+    need_words = transcribe and (not words_path.exists() or cfg.force)
+    need_subs  = transcribe and not cfg.no_subtitles and (not subs_path.exists() or cfg.force)
+
+    if not need_video and not need_words and not need_subs:
+        log.info("[skip] %s — all outputs exist", talk_id)
         return
 
     if cfg.dry_run:
-        log.info("[dry-run] would build %s → %s", talk_id, output)
+        missing = []
+        if need_video:
+            missing.append(output.name)
+        if need_words:
+            missing.append(words_path.name)
+        if need_subs:
+            missing.append(subs_path.name)
+        log.info("[dry-run] %s — would generate: %s", talk_id, ", ".join(missing))
         return
 
     # --- Validate talk duration before doing any expensive work ---
@@ -141,32 +171,43 @@ def process_talk(row: dict, cfg: Config, whisper_ctx: dict | None) -> None:
         Segment(source=BLACK, pad_end=BLACK_PAD + FADE_DURATION, audio="silence"),
     ]
 
-    # --- Compute talk audio offset (cheap — reads cached segment durations) ---
-    offset = talk_offset(recipe, cfg.cache, cfg.vcodec)
-
-    # --- Start transcription in parallel with rendering ---
-    # Transcription works directly from the source file and only needs the
-    # offset for subtitle timestamp alignment — it does not need the rendered video.
+    # --- Transcription thread (if words need to be generated) ---
+    # Runs in parallel with rendering; works directly from the source file.
     transcribe_thread: threading.Thread | None = None
-    if whisper_ctx is not None:
-        srt_path = cfg.output / f"{talk_id}.srt"
-        if not srt_path.exists() or cfg.force:
-            transcribe_thread = threading.Thread(
-                target=transcribe_talk,
-                args=(source, start, end, offset, srt_path, whisper_ctx, cfg.whisper_language, cfg.force),
-            )
-            transcribe_thread.start()
-        else:
-            log.info("[skip] %s — SRT already exists", talk_id)
+    if need_words:
+        offset = talk_offset(recipe, cfg.cache, cfg.vcodec)
+        transcribe_thread = threading.Thread(
+            target=transcribe_talk,
+            args=(source, start, end, offset, words_path, whisper_ctx,
+                  cfg.whisper_language, cfg.force),
+        )
+        transcribe_thread.start()
 
-    # --- Render the full video ---
-    assemble(recipe, output, cfg.vcodec, cfg.cache)
+    # --- Render the video (only if needed) ---
+    if need_video:
+        assemble(recipe, output, cfg.vcodec, cfg.cache)
 
     # --- Wait for transcription to finish ---
     if transcribe_thread is not None:
         transcribe_thread.join()
 
-    log.info("[done] %s → %s", talk_id, output)
+    # --- Derive subtitle SRT from word-level data (if needed) ---
+    # If need_words was True, the thread wrote the words file and we can use it.
+    # If need_words was False but need_subs is True, the words file was already
+    # cached — parse it and reformat without touching Whisper.
+    if need_subs:
+        words = _parse_word_srt(words_path)
+        if words:
+            subs = _words_to_subtitles(words)
+            _write_srt(subs, subs_path)
+            log.info(
+                "[transcribing] %s — wrote %d subtitles → %s",
+                talk_id, len(subs), subs_path,
+            )
+        else:
+            log.warning("[transcribing] %s — no words available, skipping subs", talk_id)
+
+    log.info("[done] %s", talk_id)
 
 
 # ---- Entry point ----
@@ -200,7 +241,9 @@ def main() -> int:
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Enable debug-level logging")
     parser.add_argument("--no-transcribe", action="store_true",
-                        help="Skip automatic SRT subtitle generation")
+                        help="Skip all transcription (no .words.srt or .subs.srt)")
+    parser.add_argument("--no-subtitles", action="store_true",
+                        help="Save word-level SRT (.words.srt) but skip Netflix subtitle SRT (.subs.srt)")
     parser.add_argument("--whisper-model", type=str, default="distil-large-v3",
                         metavar="MODEL",
                         help="Whisper model name (default: distil-large-v3)")
@@ -235,6 +278,7 @@ def main() -> int:
         dry_run=args.dry_run,
         verbose=args.verbose,
         no_transcribe=args.no_transcribe,
+        no_subtitles=args.no_subtitles,
         whisper_model=args.whisper_model,
         whisper_language=args.whisper_language,
     )
