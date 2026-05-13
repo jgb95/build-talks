@@ -26,6 +26,10 @@ from build_talks.config import (
     TITLE_DURATION,
     FADE_DURATION,
     SPONSOR_HOLD,
+    DO_SPACES_BUCKET,
+    DO_SPACES_REGION,
+    DO_SPACES_KEY,
+    DO_SPACES_SECRET,
     Config,
 )
 from build_talks import ffmpeg
@@ -37,6 +41,7 @@ from build_talks.transcribe import (
     load_model, transcribe_talk,
     _parse_word_srt, _words_to_subtitles, _write_srt,
 )
+from build_talks.upload import upload_talk
 
 log = logging.getLogger(__name__)
 
@@ -250,6 +255,11 @@ def main() -> int:
     parser.add_argument("--whisper-language", type=str, default="en",
                         metavar="LANG",
                         help="BCP-47 language code for Whisper (default: en)")
+    parser.add_argument("--upload", action="store_true",
+                        help="Upload rendered outputs (.mp4, .words.srt, .subs.srt) "
+                             "to Digital Ocean Spaces after all talks are processed. "
+                             "Requires DO_SPACES_KEY and DO_SPACES_SECRET env vars. "
+                             "Event name is read from the Notion 'Event' property.")
     args = parser.parse_args()
 
     # ---- Logging ----
@@ -281,6 +291,7 @@ def main() -> int:
         no_subtitles=args.no_subtitles,
         whisper_model=args.whisper_model,
         whisper_language=args.whisper_language,
+        upload=args.upload,
     )
 
     # ---- Pre-flight checks ----
@@ -402,6 +413,58 @@ def main() -> int:
         except Exception as exc:
             log.error("[error] %s — %s", talk_id, exc)
             failed.append(talk_id)
+
+    # ---- Upload pass (after all talks are processed) ----
+    if cfg.upload and not cfg.dry_run:
+        if not DO_SPACES_KEY or not DO_SPACES_SECRET:
+            log.error(
+                "--upload requires DO_SPACES_KEY and DO_SPACES_SECRET to be set"
+            )
+            return 1
+
+        upload_targets = [r for r in rows if r["id"].strip() not in failed]
+        log.info("[upload] uploading %d talk(s)...", len(upload_targets))
+
+        upload_failed: list[str] = []
+        for row in upload_targets:
+            talk_id = row["id"].strip()
+            event = ""
+            if fetcher is not None:
+                try:
+                    event = fetcher.get_event(talk_id)
+                except Exception as exc:
+                    log.warning("[upload] %s — could not get event: %s", talk_id, exc)
+            if not event:
+                log.warning(
+                    "[upload] %s — skipping upload: no event name found in Notion",
+                    talk_id,
+                )
+                upload_failed.append(talk_id)
+                continue
+            try:
+                uploaded = upload_talk(
+                    talk_id,
+                    event,
+                    cfg.output,
+                    bucket=DO_SPACES_BUCKET,
+                    region=DO_SPACES_REGION,
+                    key=DO_SPACES_KEY,
+                    secret=DO_SPACES_SECRET,
+                )
+                log.info(
+                    "[upload] %s — uploaded %d file(s)", talk_id, len(uploaded)
+                )
+            except Exception as exc:
+                log.error("[upload] %s — %s", talk_id, exc)
+                upload_failed.append(talk_id)
+
+        if upload_failed:
+            log.error(
+                "[upload] %d talk(s) failed to upload: %s",
+                len(upload_failed), ", ".join(upload_failed),
+            )
+        else:
+            log.info("[upload] all uploads complete")
 
     # ---- Summary ----
     if failed:

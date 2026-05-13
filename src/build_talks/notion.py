@@ -15,7 +15,9 @@ import requests
 from notion_client import Client as NotionClient
 from notion_client.client import ClientOptions as NotionClientOptions
 
-from build_talks.config import NOTION_CLIPART_PROP, NOTION_SOCIAL_CARD_PROP
+from build_talks.config import DO_SPACES_BASE_URL, NOTION_CLIPART_PROP, NOTION_SOCIAL_CARD_PROP
+
+NOTION_EVENT_PROP = "Event"
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +87,45 @@ class NotionFetcher:
         # Strip the file extension, e.g. "talk-01.png" → "talk-01"
         return raw.rsplit(".", 1)[0]
 
+    def _resolve_url(self, url: str) -> str:
+        """
+        Resolve a URL that may be a full URL or a relative path.
+
+        Relative paths (starting with '/') are prepended with DO_SPACES_BASE_URL
+        so both formats reference the same Digital Ocean Spaces endpoint.
+        """
+        if url.startswith(("http://", "https://")):
+            return url
+        return DO_SPACES_BASE_URL.rstrip("/") + "/" + url.lstrip("/")
+
+    def get_event(self, talk_id: str) -> str:
+        """
+        Return the event name (e.g. 'durham') for the given talk ID.
+
+        Reads the 'Event' property; returns an empty string if absent.
+        """
+        page = self._pages.get(talk_id)
+        if not page:
+            raise KeyError(
+                f"No Notion page found with {NOTION_CLIPART_PROP} ID='{talk_id}'"
+            )
+
+        prop = page["properties"].get(NOTION_EVENT_PROP)
+        if not prop:
+            return ""
+
+        ptype = prop["type"]
+        if ptype == "select":
+            sel = prop["select"]
+            return sel["name"].strip() if sel else ""
+        elif ptype == "rich_text":
+            return "".join(t["plain_text"] for t in prop["rich_text"]).strip()
+        elif ptype == "title":
+            return "".join(t["plain_text"] for t in prop["title"]).strip()
+        elif ptype == "formula":
+            return prop["formula"].get("string", "").strip()
+        return ""
+
     def get_social_card_url(self, talk_id: str) -> str:
         """Return the SocialCard image download URL for the given talk ID."""
         page = self._pages.get(talk_id)
@@ -135,7 +176,7 @@ class NotionFetcher:
             if existing.suffix.lower() != ".mp4":
                 return existing
 
-        url = self.get_social_card_url(talk_id)
+        url = self._resolve_url(self.get_social_card_url(talk_id))
         ext = Path(urlparse(url).path).suffix or ".png"
         dest = titles_dir / f"{talk_id}{ext}"
 

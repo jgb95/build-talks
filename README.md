@@ -26,19 +26,22 @@ subtitle file — all in one command.
 # 1. Clone / navigate to the project directory
 cd build-talks
 
-# 2. Create a virtual environment with a clean Python 3.12
-uv venv --python 3.12 .venv
-
-# 3. Install the package (editable, so source edits take effect immediately)
-uv pip install --python .venv/bin/python -e .
-
-# 4. Activate the environment
-source .venv/bin/activate
+# 2. Create the virtual environment and install all dependencies
+uv sync
 ```
 
-After activation, the `build-talks` command is available anywhere in your
-shell session. To make it permanent, add the activation line to your
-`~/.zshrc` or `~/.bash_profile`.
+That's it — `uv sync` creates `.venv/`, pins dependencies into `uv.lock`, and
+installs the package in editable mode. Run it again any time you pull new
+changes to keep the environment in sync.
+
+Before running the tool, activate the environment in your current shell:
+
+```bash
+source /path/to/build-talks/.venv/bin/activate
+```
+
+`build-talks` will then be available in that shell session for any working
+directory.
 
 ---
 
@@ -49,12 +52,21 @@ shell session. To make it permanent, add the activation line to your
 Create a `.env` file in your working directory (or export the variables):
 
 ```dotenv
+# ---- Notion (required) ----
 NOTION_TOKEN=secret_xxxxxxxxxxxxxxxxxxxx
 NOTION_CONFTALKS_DB_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# Optional — override the default Notion property names for title-card images
+# ---- Notion property name overrides (optional) ----
 # NOTION_CLIPART_PROP=Clipart
 # NOTION_SOCIAL_CARD_PROP=SocialCard
+
+# ---- Digital Ocean Spaces — required when using --upload ----
+DO_SPACES_KEY=xxxxxxxxxxxxxxxxxxxx
+DO_SPACES_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# ---- Digital Ocean Spaces overrides (optional) ----
+# DO_SPACES_BUCKET=btcpp
+# DO_SPACES_REGION=nyc3
 ```
 
 ### `talks.csv`
@@ -71,6 +83,9 @@ Extra columns are ignored.
 ---
 
 ## Usage
+
+With the venv activated (see Installation), `build-talks` works from any
+directory — point it at your video files with the CSV flags:
 
 ```bash
 # Standard run (reads talks.csv and sponsor.mp4 from CWD)
@@ -94,6 +109,9 @@ build-talks --no-transcribe
 # Use software encoder (libx264) instead of hardware (h264_videotoolbox)
 build-talks --software-encode
 
+# Upload outputs to Digital Ocean Spaces after processing
+build-talks --upload
+
 # Debug logging
 build-talks --verbose
 ```
@@ -101,10 +119,10 @@ build-talks --verbose
 ### All options
 
 ```
---csv PATH            Path to the talks CSV              (default: talks.csv)
---sponsor PATH        Path to the sponsor reel           (default: sponsor.mp4)
---output PATH         Output directory                   (default: output/)
---cache PATH          Cache directory                    (default: cache/)
+--csv PATH            Path to the talks CSV                    (default: talks.csv)
+--sponsor PATH        Path to the sponsor reel                 (default: sponsor.mp4)
+--output PATH         Output directory                         (default: output/)
+--cache PATH          Cache directory                          (default: cache/)
 --keep-cache          Don't delete cache after a successful run
 --force               Re-build even if output already exists
 --only ID             Process only the talk with this ID
@@ -112,9 +130,11 @@ build-talks --verbose
 --software-encode     Use libx264 instead of h264_videotoolbox
 --dry-run             Show what would run, without doing any work
 --verbose, -v         Debug-level logging
---no-transcribe       Skip SRT subtitle generation
---whisper-model MODEL Whisper model name                 (default: distil-large-v3)
---whisper-language LANG BCP-47 language code             (default: en)
+--no-transcribe       Skip all transcription (no .words.srt or .subs.srt)
+--no-subtitles        Save word-level SRT but skip Netflix subtitle SRT
+--whisper-model MODEL Whisper model name                       (default: distil-large-v3)
+--whisper-language LANG BCP-47 language code                   (default: en)
+--upload              Upload .mp4, .words.srt, .subs.srt to Digital Ocean Spaces
 ```
 
 ---
@@ -123,8 +143,9 @@ build-talks --verbose
 
 ```
 output/
-  <id>.mp4    # Final assembled video
-  <id>.srt    # Auto-generated subtitles (unless --no-transcribe)
+  <id>.mp4        # Final assembled video
+  <id>.words.srt  # Word-level subtitle timings (unless --no-transcribe)
+  <id>.subs.srt   # Netflix-style subtitle SRT (unless --no-transcribe or --no-subtitles)
 ```
 
 The cache directory (default `cache/`) is deleted automatically after a
@@ -157,9 +178,9 @@ src/
 ```bash
 # Editable install already covers code changes — no reinstall needed.
 
-# Run directly without activating the venv:
-.venv/bin/build-talks --help
+# Run via uv (no activation needed):
+uv run build-talks --help
 
-# Or via the module:
-.venv/bin/python -m build_talks --help
+# Or via the module entry point:
+uv run python -m build_talks --help
 ```

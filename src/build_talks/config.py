@@ -38,6 +38,15 @@ VCODEC_SW = "libx264"
 NOTION_CLIPART_PROP = os.getenv("NOTION_CLIPART_PROP", "Clipart")
 NOTION_SOCIAL_CARD_PROP = os.getenv("NOTION_SOCIAL_CARD_PROP", "SocialCard")
 
+# ---- Digital Ocean Spaces (upload + URL resolution) ----
+DO_SPACES_BUCKET = os.getenv("DO_SPACES_BUCKET", "btcpp")
+DO_SPACES_REGION = os.getenv("DO_SPACES_REGION", "nyc3")
+DO_SPACES_BASE_URL = (
+    f"https://{DO_SPACES_BUCKET}.{DO_SPACES_REGION}.digitaloceanspaces.com"
+)
+DO_SPACES_KEY    = os.getenv("DO_SPACES_KEY", "")
+DO_SPACES_SECRET = os.getenv("DO_SPACES_SECRET", "")
+
 # ---- Validation ----
 # Valid timestamp: HH:MM:SS or HH:MM:SS.mmm
 TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}:\d{2}(\.\d+)?$")
@@ -67,3 +76,4 @@ class Config:
     no_subtitles: bool
     whisper_model: str
     whisper_language: str
+    upload: bool
