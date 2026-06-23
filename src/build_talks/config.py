@@ -21,14 +21,12 @@ ACODEC = "aac"
 SAMPLE_RATE = 48000
 
 # ---- Timing (seconds) ----
-# How long the title card is *visibly* held.
-# The rendered title clip is TITLE_DURATION + 2 * FADE_DURATION to give
-# the xfade filters FADE_DURATION seconds of headroom on each side.
+# Every transition uses the same 1s crossfade.
+# Non-raw segments are internally padded only to provide that fade headroom;
+# we do not intentionally hold content beyond the crossfade window.
 TITLE_DURATION = 3
 FADE_DURATION = 1   # duration of every crossfade / fade-in / fade-out
-BLACK_PAD = 0.5     # pure black held before/after the fades
-SPONSOR_HOLD = 2    # seconds the last frame of sponsor is visibly frozen
-                    # (actual tpad stop_duration = SPONSOR_HOLD + FADE_DURATION)
+BLACK_PAD = 0.5     # held-black duration used by automatic head/tail bookends
 
 # ---- Hardware encoder (Apple Silicon) vs software fallback ----
 VCODEC_HW = "h264_videotoolbox"
@@ -38,14 +36,13 @@ VCODEC_SW = "libx264"
 NOTION_CLIPART_PROP = os.getenv("NOTION_CLIPART_PROP", "Clipart")
 NOTION_SOCIAL_CARD_PROP = os.getenv("NOTION_SOCIAL_CARD_PROP", "SocialCard")
 
-# ---- Digital Ocean Spaces (upload + URL resolution) ----
-DO_SPACES_BUCKET = os.getenv("DO_SPACES_BUCKET", "btcpp")
-DO_SPACES_REGION = os.getenv("DO_SPACES_REGION", "nyc3")
-DO_SPACES_BASE_URL = (
-    f"https://{DO_SPACES_BUCKET}.{DO_SPACES_REGION}.digitaloceanspaces.com"
+# ---- Asset URL base (for relative Notion SocialCard paths) ----
+# Prefer explicit ASSET_BASE_URL, but keep compatibility with the previous
+# DO_SPACES_BUCKET/DO_SPACES_REGION defaults when ASSET_BASE_URL is not set.
+ASSET_BASE_URL = os.getenv("ASSET_BASE_URL") or (
+    f"https://{os.getenv('DO_SPACES_BUCKET', 'btcpp')}"
+    f".{os.getenv('DO_SPACES_REGION', 'nyc3')}.digitaloceanspaces.com"
 )
-DO_SPACES_KEY    = os.getenv("DO_SPACES_KEY", "")
-DO_SPACES_SECRET = os.getenv("DO_SPACES_SECRET", "")
 
 # ---- Validation ----
 # Valid timestamp: HH:MM:SS or HH:MM:SS.mmm
@@ -61,8 +58,8 @@ class Config:
     through the pipeline so functions receive context without needing
     a long parameter list or global mutable state.
     """
-    csv: Path
-    sponsor: Path
+    recordings: Path
+    talks: Path
     output: Path
     cache: Path
     keep_cache: bool
@@ -76,4 +73,3 @@ class Config:
     no_subtitles: bool
     whisper_model: str
     whisper_language: str
-    upload: bool

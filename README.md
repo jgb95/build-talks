@@ -1,186 +1,234 @@
 # build-talks
 
-An internal tool for **Bitcoin++** that assembles polished conference talk
-videos from raw source recordings. Each talk gets a title card (pulled from
-Notion), a sponsor reel, crossfade transitions, and an auto-generated SRT
-subtitle file — all in one command.
+An internal tool for **Bitcoin++** that assembles polished conference videos
+from raw source recordings.
+
+The pipeline is now **manifest + recipe driven**:
+
+- `individual` recipe: title card + sponsor + one talk
+- `playlist` recipe: sponsor bookends + multiple talks in sequence
+
+This structure is intentionally close to what a backend admin dashboard would
+send as job payloads.
 
 ---
 
 ## Requirements
 
-- **macOS** with Apple Silicon (uses `h264_videotoolbox` by default; pass
-  `--software-encode` for `libx264` on any platform)
 - **ffmpeg** in `$PATH`
 - **[uv](https://docs.astral.sh/uv/)** for dependency and environment management
-- A talks CSV and sponsor video (default to `talks.csv` and `sponsor.mp4` in
-  the working directory; override with `--csv` and `--sponsor`)
-- The raw source video files referenced by the CSV
-- A `.env` file (or exported env vars) with your Notion credentials
+- A recordings manifest JSON (default: `recordings.json`)
+- A talks registry CSV (default: `talks.csv`)
+- Any media assets referenced by recipe steps (for example `sponsor.mp4`)
+- Raw source video files referenced by the manifest
+- Optional: `.env` with Notion credentials (for title card download)
+
+By default the tool uses `h264_videotoolbox` on macOS; use
+`--software-encode` to force `libx264`.
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Clone / navigate to the project directory
 cd build-talks
-
-# 2. Create the virtual environment and install all dependencies
 uv sync
 ```
 
-That's it — `uv sync` creates `.venv/`, pins dependencies into `uv.lock`, and
-installs the package in editable mode. Run it again any time you pull new
-changes to keep the environment in sync.
+`uv sync` creates `.venv/`, installs dependencies, and registers the
+`build-talks` command.
 
-Before running the tool, activate the environment in your current shell:
+Run commands either with an activated venv or via `uv run`:
 
 ```bash
-source /path/to/build-talks/.venv/bin/activate
+uv run build-talks --help
 ```
-
-`build-talks` will then be available in that shell session for any working
-directory.
 
 ---
 
 ## Configuration
 
-### `.env`
-
-Create a `.env` file in your working directory (or export the variables):
+### `.env` (optional)
 
 ```dotenv
-# ---- Notion (required) ----
+# ---- Notion ----
 NOTION_TOKEN=secret_xxxxxxxxxxxxxxxxxxxx
 NOTION_CONFTALKS_DB_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# ---- Notion property name overrides (optional) ----
+# Optional property name overrides
 # NOTION_CLIPART_PROP=Clipart
 # NOTION_SOCIAL_CARD_PROP=SocialCard
 
-# ---- Digital Ocean Spaces — required when using --upload ----
-DO_SPACES_KEY=xxxxxxxxxxxxxxxxxxxx
-DO_SPACES_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# ---- Digital Ocean Spaces overrides (optional) ----
-# DO_SPACES_BUCKET=btcpp
-# DO_SPACES_REGION=nyc3
+# Optional: base URL for relative SocialCard values in Notion
+# (defaults to https://btcpp.nyc3.digitaloceanspaces.com for compatibility)
+# ASSET_BASE_URL=https://assets.example.com
 ```
 
-### `talks.csv`
+If `--no-notion` is used (or Notion credentials are missing), individual job
+title cards must already exist in:
 
-| Column        | Required | Description |
-|---------------|----------|-------------|
-| `id`          | ✅        | Unique talk identifier (used for output filenames) |
-| `source_file` | ✅        | Path to the raw recording (relative to CWD) |
-| `start_time`  | ✅        | Trim start — `HH:MM:SS` or `HH:MM:SS.mmm` |
-| `end_time`    | ✅        | Trim end — `HH:MM:SS` or `HH:MM:SS.mmm` |
+```text
+cache/titles/<talk_id>.*
+```
 
-Extra columns are ignored.
+### `recordings.json`
+
+The manifest is a JSON array of jobs.
+
+Recipe step schema (trimmed for clarity):
+
+- `video`: `{ "video": { "src": "...", "each"?: boolean } }`
+- `photo`: `{ "photo": { "src"?: "...", "from"?: "talk", "duration"?: number, "each"?: boolean } }`
+- `talk`: `{ "talk": { "each"?: boolean } }`
+
+Notes:
+
+- `video` no longer accepts custom hold/padding knobs; sponsor/media clips use a plain
+  `FADE_DURATION` head/tail pad internally so all transitions stay consistent.
+- `photo.duration` is optional and defaults to `TITLE_DURATION` (3s).
+- Every transition uses a standard 1-second crossfade.
+- Outputs automatically include head/tail black bookends: **0.5s held black + 1s fade**
+  at the start, and 1s fade + 0.5s held black at the end.
+
+#### `individual` job
+
+```json
+{
+  "type": "individual",
+  "id": "day1-talks",
+  "talks": ["alice-utxo-mgmt", "bob-lightning"],
+  "recipe": [
+    { "photo": { "from": "talk" } },
+    { "talk": {} },
+    { "video": { "src": "sponsor.mp4" } }
+  ]
+}
+```
+
+This produces one output per talk using ids in the form:
+`<job-id>_<talk-id>`.
+
+#### `playlist` job
+
+```json
+{
+  "type": "playlist",
+  "id": "day1-playlist",
+  "talks": ["alice-utxo-mgmt", "bob-lightning"],
+  "recipe": [
+    { "video": { "src": "sponsor.mp4" } },
+    { "photo": { "from": "talk", "duration": 3, "each": true } },
+    { "talk": { "each": true } },
+    { "video": { "src": "sponsor.mp4" } }
+  ]
+}
+```
+
+Included sample: [`recordings.json`](./recordings.json)
+
+#### `talks.csv`
+
+Talk timing/source windows are defined separately in CSV and referenced by id
+from the manifest jobs.
+
+```csv
+id,source_file,start_time,end_time
+alice-utxo-mgmt,day1.mp4,00:10:00,00:45:30
+bob-lightning,day1.mp4,00:50:00,01:25:00
+```
+
+Timestamp format: `HH:MM:SS` or `HH:MM:SS.mmm`.
 
 ---
 
 ## Usage
 
-With the venv activated (see Installation), `build-talks` works from any
-directory — point it at your video files with the CSV flags:
-
 ```bash
-# Standard run (reads talks.csv and sponsor.mp4 from CWD)
-build-talks
+# Standard run (reads recordings.json and talks.csv)
+uv run build-talks
 
-# Process a single talk by ID
-build-talks --only my-talk-id
+# Process one job by ID
+uv run build-talks --only day1-playlist
 
-# Dry run — show what would be processed without doing any work
-build-talks --dry-run
+# Dry-run validation + planning output only
+uv run build-talks --dry-run
 
-# Re-build even if output files already exist
-build-talks --force
+# Force rebuild outputs
+uv run build-talks --force
 
-# Skip Notion — title card images must already be in cache/titles/<id>.*
-build-talks --no-notion
+# Skip Notion (use local cache/titles/<id>.*)
+uv run build-talks --no-notion
 
-# Skip subtitle generation
-build-talks --no-transcribe
+# Skip all transcription
+uv run build-talks --no-transcribe
 
-# Use software encoder (libx264) instead of hardware (h264_videotoolbox)
-build-talks --software-encode
+# Keep word-level subtitles but skip formatted subtitle cards
+uv run build-talks --no-subtitles
 
-# Upload outputs to Digital Ocean Spaces after processing
-build-talks --upload
-
-# Debug logging
-build-talks --verbose
+# Use software encoding
+uv run build-talks --software-encode
 ```
 
-### All options
+### CLI options
 
-```
---csv PATH            Path to the talks CSV                    (default: talks.csv)
---sponsor PATH        Path to the sponsor reel                 (default: sponsor.mp4)
---output PATH         Output directory                         (default: output/)
---cache PATH          Cache directory                          (default: cache/)
---keep-cache          Don't delete cache after a successful run
---force               Re-build even if output already exists
---only ID             Process only the talk with this ID
---no-notion           Skip Notion; use pre-placed images in cache/titles/
---software-encode     Use libx264 instead of h264_videotoolbox
---dry-run             Show what would run, without doing any work
---verbose, -v         Debug-level logging
---no-transcribe       Skip all transcription (no .words.srt or .subs.srt)
---no-subtitles        Save word-level SRT but skip Netflix subtitle SRT
---whisper-model MODEL Whisper model name                       (default: distil-large-v3)
---whisper-language LANG BCP-47 language code                   (default: en)
---upload              Upload .mp4, .words.srt, .subs.srt to Digital Ocean Spaces
+```text
+--recordings PATH       Path to recordings manifest JSON        (default: recordings.json)
+--talks PATH            Path to talks CSV registry              (default: talks.csv)
+--output PATH           Output directory                        (default: output/)
+--cache PATH            Cache directory                         (default: cache/)
+--keep-cache            Don't delete cache after a successful run
+--force                 Re-build even if outputs exist
+--only ID               Process only the job with this ID
+--no-notion             Skip Notion; use pre-placed images in cache/titles/
+--software-encode       Use libx264 instead of h264_videotoolbox
+--dry-run               Show what would run, without doing any work
+--verbose, -v           Debug-level logging
+--no-transcribe         Skip all transcription (no .words.srt or .subs.srt)
+--no-subtitles          Save word-level SRT but skip Netflix subtitle SRT
+--whisper-model MODEL   Whisper model name                      (default: distil-large-v3)
+--whisper-language LANG BCP-47 language code                    (default: en)
 ```
 
 ---
 
 ## Output
 
-```
+Each rendered output id generates:
+
+```text
 output/
-  <id>.mp4        # Final assembled video
-  <id>.words.srt  # Word-level subtitle timings (unless --no-transcribe)
-  <id>.subs.srt   # Netflix-style subtitle SRT (unless --no-transcribe or --no-subtitles)
+  <id>.mp4
+  <id>.words.srt
+  <id>.subs.srt
 ```
 
-The cache directory (default `cache/`) is deleted automatically after a
-successful run unless `--keep-cache` is passed. On failure, the cache is
-preserved so you can inspect intermediate files.
+For playlist jobs, subtitle files are merged across all talks into one set of
+files for the final combined video timeline.
+
+For `individual` jobs, output ids are expanded as `<job-id>_<talk-id>`.
+
+Cache directory (`cache/`) is removed after successful runs unless
+`--keep-cache` is passed. On failure, cache is preserved for debugging.
 
 ---
 
 ## Project layout
 
-```
-build-talks.py              # Original monolithic script (preserved for reference)
-pyproject.toml              # Package metadata and dependencies
+```text
+pyproject.toml
+recordings.json          # Example manifest
+talks.csv                # Talk registry (id, source_file, start/end)
 src/
   build_talks/
-    __init__.py             # Package marker + __version__
-    __main__.py             # Enables: python -m build_talks
-    config.py               # Constants (format, timing, codecs) + Config dataclass
-    ffmpeg.py               # ffmpeg subprocess helpers and probe utilities
-    render.py               # Title card, sponsor, and full-talk rendering
-    notion.py               # Notion title-card image downloader
-    transcribe.py           # Whisper model loading + SRT generation
-    cli.py                  # Argument parsing, validation, and main loop
-```
-
----
-
-## Development
-
-```bash
-# Editable install already covers code changes — no reinstall needed.
-
-# Run via uv (no activation needed):
-uv run build-talks --help
-
-# Or via the module entry point:
-uv run python -m build_talks --help
+    __init__.py
+    __main__.py
+    cli.py               # Manifest parsing and orchestration
+    config.py            # Constants + Config dataclass
+    ffmpeg.py            # ffmpeg helpers/probe/progress plumbing
+    notion.py            # Notion title-card fetcher
+    recipes.py           # Recipe builders (individual, playlist)
+    render.py            # Segment assembly + final filtergraph
+    segment.py           # Segment model, caching, timeline offsets
+    talks.py             # CSV talk loader and validation
+    transcribe.py        # Whisper + SRT generation
 ```

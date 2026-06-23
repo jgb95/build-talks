@@ -15,7 +15,7 @@ import requests
 from notion_client import Client as NotionClient
 from notion_client.client import ClientOptions as NotionClientOptions
 
-from build_talks.config import DO_SPACES_BASE_URL, NOTION_CLIPART_PROP, NOTION_SOCIAL_CARD_PROP
+from build_talks.config import ASSET_BASE_URL, NOTION_CLIPART_PROP, NOTION_SOCIAL_CARD_PROP
 
 NOTION_EVENT_PROP = "Event"
 
@@ -91,12 +91,11 @@ class NotionFetcher:
         """
         Resolve a URL that may be a full URL or a relative path.
 
-        Relative paths (starting with '/') are prepended with DO_SPACES_BASE_URL
-        so both formats reference the same Digital Ocean Spaces endpoint.
+        Relative paths (starting with '/') are prepended with ASSET_BASE_URL.
         """
         if url.startswith(("http://", "https://")):
             return url
-        return DO_SPACES_BASE_URL.rstrip("/") + "/" + url.lstrip("/")
+        return ASSET_BASE_URL.rstrip("/") + "/" + url.lstrip("/")
 
     def get_event(self, talk_id: str) -> str:
         """

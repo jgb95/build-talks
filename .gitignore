@@ -36,9 +36,10 @@ ENV/
 .vscode/
 .idea/
 
-# Project runtime outputs
+# Project runtime
 output/
 cache/
+recordings/
 
 # Video files (large; not tracked — user supplies their own)
 *.mp4

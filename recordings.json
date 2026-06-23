@@ -1,0 +1,29 @@
+[
+  {
+    "type": "individual",
+    "id": "durham25_talks",
+    "talks": [
+      "du_nifty"
+    ],
+    "recipe": [
+      { "photo": { "from": "talk", "duration": 3 } },
+      { "video": { "src": "sponsor.mp4" } },
+      { "talk": {} },
+      { "video": { "src": "sponsor.mp4" } }
+    ]
+  },
+  {
+    "type": "playlist",
+    "id": "durham25_day1_playlist",
+    "talks": [
+      "du_vnprc",
+      "du_nifty"
+    ],
+    "recipe": [
+      { "video": { "src": "sponsor.mp4", "each": true } },
+      { "photo": { "from": "talk", "duration": 3, "each": true } },
+      { "talk": { "each": true } },
+      { "video": { "src": "sponsor.mp4" } }
+    ]
+  }
+]

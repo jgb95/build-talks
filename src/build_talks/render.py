@@ -25,12 +25,7 @@ from build_talks.ffmpeg import (
     run,
     vcodec_flags,
 )
-from build_talks.segment import (
-    AudioSource,
-    Segment,
-    prepare_segment,
-    seg_duration,
-)
+from build_talks.segment import Segment, prepare_segment, seg_duration
 
 log = logging.getLogger(__name__)
 
@@ -111,60 +106,31 @@ def build_filtergraph(
     vf_parts.append(f"[{prev}]null[vout]")
 
     # --- Audio filtergraph ---
-    # Walk segments and group consecutive ones that share the same audio source.
-    # Each group gets one audio input/node that spans the full group duration.
+    # Build one audio node per segment, then chain them with acrossfade so this
+    # works for timelines with multiple raw talk segments (e.g. livestreams).
     af_parts: list[str] = []
     audio_inputs: list[str] = []  # extra -i args appended after video inputs
-    audio_base_idx = n  # first audio input index (after all video/raw inputs)
+    audio_base_idx = n  # first external-audio input index
 
-    raw_idx = next((i for i, (seg, _) in enumerate(pairs) if seg.raw), None)
-
-    # Build audio groups: list of (audio_source, group_duration, group_start_offset_in_final)
-    groups: list[tuple[AudioSource, float, float]] = []
-    group_audio = pairs[0][0].audio
-    group_dur = durations[0]
-    group_start = 0.0
-    for i in range(1, n):
-        seg = pairs[i][0]
-        if seg.audio == group_audio:
-            group_dur += durations[i] - F  # overlapping xfade
-        else:
-            groups.append((group_audio, group_dur, group_start))
-            group_start += group_dur - F
-            group_audio = seg.audio
-            group_dur = durations[i]
-    groups.append((group_audio, group_dur, group_start))
-
-    # Build the audio chain for each group.
     audio_labels: list[str] = []
-    for gi, (audio_src, g_dur, g_start) in enumerate(groups):
-        label = f"ag{gi}"
-        if audio_src == "silence":
+    for i, (seg, _) in enumerate(pairs):
+        label = f"a{i}"
+        dur = durations[i]
+        if seg.audio == "silence":
             af_parts.append(
                 f"anullsrc=channel_layout=stereo:sample_rate={SAMPLE_RATE},"
-                f"atrim=end={g_dur:.6f},asetpts=PTS-STARTPTS[{label}]"
+                f"atrim=end={dur:.6f},asetpts=PTS-STARTPTS[{label}]"
             )
-        elif audio_src == "source":
-            # The raw talk segment provides its own audio.
-            # Fade in at the start and fade out at the end.
-            af_parts += [
-                f"[{raw_idx}:a]asplit=3[ta1][ta2][ta3]",
-                f"[ta1]atrim=start=0:end={F},asetpts=PTS-STARTPTS,afade=t=in:st=0:d={F}[a_fadein]",
-                f"[ta2]atrim=start={F}:end={g_dur - F},asetpts=PTS-STARTPTS[a_mid]",
-                f"[ta3]atrim=start={g_dur - F}:end={g_dur},asetpts=PTS-STARTPTS,"
-                f"afade=t=out:st=0:d={F}[a_fadeout]",
-                f"[a_fadein][a_mid][a_fadeout]concat=n=3:v=0:a=1[{label}]",
-            ]
+        elif seg.audio == "source":
+            af_parts.append(f"[{i}:a]atrim=end={dur:.6f},asetpts=PTS-STARTPTS[{label}]")
         else:
-            # External audio file: add as an extra input and trim to group duration.
-            ext_idx = audio_base_idx + len(audio_inputs)
-            audio_inputs += ["-i", str(audio_src)]
+            ext_idx = audio_base_idx + (len(audio_inputs) // 2)
+            audio_inputs += ["-i", str(seg.audio)]
             af_parts.append(
-                f"[{ext_idx}:a]atrim=end={g_dur:.6f},asetpts=PTS-STARTPTS[{label}]"
+                f"[{ext_idx}:a]atrim=end={dur:.6f},asetpts=PTS-STARTPTS[{label}]"
             )
         audio_labels.append(label)
 
-    # Crossfade audio groups together.
     if len(audio_labels) == 1:
         af_parts.append(f"[{audio_labels[0]}]anull[aout]")
     else:

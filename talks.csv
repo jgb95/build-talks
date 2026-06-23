@@ -1,9 +1,9 @@
 id,source_file,start_time,end_time
-du_research,durham25/REC_0002.MP4,00:03:13.393,00:32:09.394
-du_johnny,durham25/REC_0005.MP4,00:04:12.886,00:39:59.764
-du_osm,durham25/REC_0002.MP4,01:07:13.863,01:43:47.788
-du_reactive,durham25/REC_0002.MP4,00:33:42.320,01:01:09.733
-du_tee,durham25/REC_0005.MP4,00:47:01.285,01:30:26.688
-du_onchain,durham25/REC_0001.MP4,00:21:07.933,01:06:38.561
-du_vnprc,durham25/REC_0001.MP4,01:16:30.853,02:20:00.993
-du_nifty,durham25/REC_0001.MP4,00:14:00.840,00:20:59.091
+du_research,recordings/REC_0002.MP4,00:03:13.393,00:32:09.394
+du_johnny,recordings/REC_0005.MP4,00:04:12.886,00:39:59.764
+du_osm,recordings/REC_0002.MP4,01:07:13.863,01:43:47.788
+du_reactive,recordings/REC_0002.MP4,00:33:42.320,01:01:09.733
+du_tee,recordings/REC_0005.MP4,00:47:01.285,01:30:26.688
+du_onchain,recordings/REC_0001.MP4,00:21:07.933,01:06:38.561
+du_vnprc,recordings/REC_0001.MP4,01:16:30.853,02:20:00.993
+du_nifty,recordings/REC_0001.MP4,00:14:00.840,00:20:59.091

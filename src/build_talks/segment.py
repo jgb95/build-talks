@@ -222,3 +222,21 @@ def talk_offset(recipe: list[Segment], cache_dir: Path, vcodec: str) -> float:
     if raw_idx is None:
         return 0.0
     return sum(durations[:raw_idx]) - raw_idx * F
+
+
+def raw_offsets(recipe: list[Segment], cache_dir: Path, vcodec: str) -> list[float]:
+    """
+    Return timeline offsets (seconds) for every raw segment in recipe order.
+
+    This is used for multi-talk timelines (e.g. livestream playlists) where each
+    talk's transcript should be shifted to its start position in the final video.
+    """
+    F = FADE_DURATION
+    pairs = [(seg, prepare_segment(seg, cache_dir, vcodec)) for seg in recipe]
+    durations = [seg_duration(seg, prepared) for seg, prepared in pairs]
+
+    offsets: list[float] = []
+    for i, seg in enumerate(recipe):
+        if seg.raw:
+            offsets.append(sum(durations[:i]) - i * F)
+    return offsets
