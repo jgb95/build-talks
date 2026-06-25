@@ -7,8 +7,12 @@ This module loads talk windows from a CSV file keyed by talk id.
 from __future__ import annotations
 
 import csv
+import logging
 from dataclasses import dataclass
 from pathlib import Path
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,7 +25,7 @@ class TalkWindow:
     end_time: str
 
 
-def load_talks(path: Path) -> dict[str, TalkWindow]:
+def load_talks(path: Path) -> tuple[dict[str, TalkWindow], set[str]]:
     """
     Load talk windows from CSV.
 
@@ -33,7 +37,9 @@ def load_talks(path: Path) -> dict[str, TalkWindow]:
 
     required = {"id", "source_file", "start_time", "end_time"}
     talks: dict[str, TalkWindow] = {}
-    errors: list[str] = []
+    fatal_errors: list[str] = []
+    skipped_warnings: list[str] = []
+    skipped_talk_ids: set[str] = set()
 
     with path.open("r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
@@ -52,24 +58,28 @@ def load_talks(path: Path) -> dict[str, TalkWindow]:
             end_time = str((row.get("end_time") or "")).strip()
 
             if not talk_id:
-                errors.append(f"{where}: missing id")
+                fatal_errors.append(f"{where}: missing id")
                 continue
             if talk_id in talks:
-                errors.append(f"{where}: duplicate id {talk_id!r}")
+                fatal_errors.append(f"{where}: duplicate id {talk_id!r}")
                 continue
             if not source_file:
-                errors.append(f"{where}: missing source_file")
+                skipped_warnings.append(f"{where}: missing source_file")
+                skipped_talk_ids.add(talk_id)
                 continue
             if not start_time:
-                errors.append(f"{where}: missing start_time")
+                skipped_warnings.append(f"{where}: missing start_time")
+                skipped_talk_ids.add(talk_id)
                 continue
             if not end_time:
-                errors.append(f"{where}: missing end_time")
+                skipped_warnings.append(f"{where}: missing end_time")
+                skipped_talk_ids.add(talk_id)
                 continue
 
             source_path = Path(source_file)
             if not source_path.exists():
-                errors.append(f"{where}: source_file not found: {source_file!r}")
+                skipped_warnings.append(f"{where}: source_file not found: {source_file!r}")
+                skipped_talk_ids.add(talk_id)
                 continue
 
             talks[talk_id] = TalkWindow(
@@ -79,7 +89,10 @@ def load_talks(path: Path) -> dict[str, TalkWindow]:
                 end_time=end_time,
             )
 
-    if errors:
-        raise ValueError("Talks CSV validation failed:\n- " + "\n- ".join(errors))
+    for warning in skipped_warnings:
+        log.warning("[skip] %s", warning)
 
-    return talks
+    if fatal_errors:
+        raise ValueError("Talks CSV validation failed:\n- " + "\n- ".join(fatal_errors))
+
+    return talks, skipped_talk_ids

@@ -41,6 +41,9 @@ output/
 cache/
 recordings/
 
+# Data folder for current working event
+data/
+
 # Video files (large; not tracked — user supplies their own)
 *.mp4
 *.MP4

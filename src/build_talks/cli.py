@@ -525,10 +525,38 @@ def main() -> int:
             return 1
 
     try:
-        talks_by_id = load_talks(cfg.talks)
+        talks_by_id, skipped_talk_ids = load_talks(cfg.talks)
     except ValueError as exc:
         log.error("%s", exc)
         return 1
+
+    if skipped_talk_ids:
+        kept_jobs: list[dict[str, Any]] = []
+        skipped_jobs: list[tuple[str, list[str]]] = []
+        for job in jobs:
+            job_id = str(job.get("id", "")).strip() or "<unknown>"
+            missing_for_job = sorted(
+                talk_id
+                for talk_id in _recording_talk_ids(job)
+                if talk_id in skipped_talk_ids
+            )
+            if missing_for_job:
+                skipped_jobs.append((job_id, missing_for_job))
+                continue
+            kept_jobs.append(job)
+
+        if skipped_jobs:
+            for job_id, missing_for_job in skipped_jobs:
+                log.warning(
+                    "[skip] job %s — references incomplete talks: %s",
+                    job_id,
+                    ", ".join(missing_for_job),
+                )
+            jobs = kept_jobs
+
+        if not jobs:
+            log.info("[run] no jobs to process after skipping incomplete talks")
+            return 0
 
     ref_errors = _validate_talk_references(jobs, talks_by_id)
     if ref_errors:
