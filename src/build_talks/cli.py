@@ -254,6 +254,8 @@ def _transcribe_recipe(
                 whisper_ctx,  # type: ignore[arg-type]
                 cfg.whisper_language,
                 cfg.force,
+                source_chunks=talk.source_chunks,
+                cache_dir=cfg.cache,
             )
             if words is None:
                 words = _parse_word_srt(tmp_words)

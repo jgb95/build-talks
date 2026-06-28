@@ -139,6 +139,35 @@ bob-lightning,day1.mp4,00:50:00,01:25:00
 
 Timestamp format: `HH:MM:SS` or `HH:MM:SS.mmm`.
 
+`source_file` supports two modes:
+
+1. **Single file path** (existing behavior)
+
+   ```csv
+   id,source_file,start_time,end_time
+   alice-utxo-mgmt,recordings/day1.mp4,00:10:00,00:45:30
+   ```
+
+2. **Chunk prefix path** (new)
+
+   ```csv
+   id,source_file,start_time,end_time
+   nairobi-main,recordings/01main1000,00:12:30,00:42:00
+   ```
+
+   The tool resolves that prefix to files in the same directory matching:
+
+   - `recordings/01main1000-00.mp4`
+   - `recordings/01main1000-01.mp4`
+   - `recordings/01main1000-02.mp4`
+   - ...
+
+   and treats them as one virtual contiguous source.
+
+   **Important:** `start_time` and `end_time` are interpreted against the virtual
+   concatenated timeline (all chunks joined in index order), not against any
+   individual chunk file.
+
 ---
 
 ## Usage

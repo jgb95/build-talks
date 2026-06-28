@@ -18,6 +18,8 @@ talk to ffmpeg binaries.
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -87,6 +89,39 @@ def anullsrc(duration: float) -> str:
         f"anullsrc=channel_layout=stereo:sample_rate={SAMPLE_RATE},"
         f"atrim=end={duration},asetpts=PTS-STARTPTS"
     )
+
+
+def concat_list_file(chunks: list[Path], cache_dir: Path) -> Path:
+    """
+    Create (or reuse) an ffmpeg concat-demuxer list file for *chunks*.
+
+    The output is stored under ``<cache_dir>/concat/`` with a deterministic
+    filename derived from the absolute chunk paths, so repeated calls are
+    idempotent and safe across concurrent build stages.
+    """
+    if not chunks:
+        raise ValueError("concat_list_file requires at least one chunk")
+
+    resolved_chunks = [p.resolve() for p in chunks]
+    digest_input = "\n".join(str(p) for p in resolved_chunks).encode("utf-8")
+    digest = hashlib.sha1(digest_input).hexdigest()[:16]
+
+    out_dir = cache_dir / "concat"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{digest}.txt"
+
+    # If file already exists, assume it was generated for the same digest input.
+    if out_path.exists():
+        return out_path
+
+    lines = []
+    for p in resolved_chunks:
+        # concat-demuxer escaping: single quote wraps path; embedded quotes escaped.
+        raw = os.fspath(p).replace("'", "'\\''")
+        lines.append(f"file '{raw}'")
+
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out_path
 
 
 def run(cmd: list[str], label: str = "", duration_us: int | None = None) -> None:

@@ -17,6 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from build_talks.ffmpeg import concat_list_file
+
 log = logging.getLogger(__name__)
 
 # ---- Netflix subtitle standards ----
@@ -93,6 +95,8 @@ def transcribe_talk(
     whisper_ctx: dict,
     language: str,
     force: bool = False,
+    source_chunks: list[Path] | None = None,
+    cache_dir: Path | None = None,
 ) -> list[dict] | None:
     """
     Transcribe the talk audio from *source* (trimmed to start/end) and write
@@ -122,6 +126,8 @@ def transcribe_talk(
         whisper_ctx:  Context dict returned by load_model().
         language:     BCP-47 language code (e.g. "en").
         force:        If True, overwrite an existing file.
+        source_chunks: Optional ordered chunk files to treat as one virtual input.
+        cache_dir:    Required when source_chunks is provided (for concat list file).
     """
     if words_path.exists() and not force:
         log.debug("[transcribing] %s — words SRT already exists, skipping Whisper", words_path.stem)
@@ -149,12 +155,21 @@ def transcribe_talk(
             dur_s = total_s % 60
             duration_str = f"{dur_h}:{dur_m:02d}:{dur_s:06.3f}"
 
+            input_args: list[str]
+            if source_chunks:
+                if cache_dir is None:
+                    raise ValueError("cache_dir is required when source_chunks is provided")
+                concat_list = concat_list_file(source_chunks, cache_dir)
+                input_args = ["-f", "concat", "-safe", "0", "-i", str(concat_list)]
+            else:
+                input_args = ["-i", str(source)]
+
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-ss", start,
                     "-t", duration_str,
-                    "-i", str(source),
+                    *input_args,
                     "-vn", "-ar", "16000", "-ac", "1",
                     str(tmp_path),
                 ],

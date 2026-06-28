@@ -63,6 +63,8 @@ class Segment:
     pad_end     -- seconds to hold/clone the last frame
     trim_start  -- HH:MM:SS timestamp to seek to in the source (raw segments only)
     trim_end    -- HH:MM:SS timestamp to stop at in the source (raw segments only)
+    source_chunks -- optional ordered chunk files that should be treated as a
+                     virtual concatenated source for raw segments
     raw         -- if True, skip pre-rendering; source is normalised inside the final
                    filtergraph (used for the talk recording to avoid a double-encode)
     """
@@ -72,6 +74,7 @@ class Segment:
     pad_end: float = 0.0
     trim_start: str | None = None
     trim_end: str | None = None
+    source_chunks: list[Path] | None = None
     raw: bool = False
 
 

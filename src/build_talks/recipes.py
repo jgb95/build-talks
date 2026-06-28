@@ -98,6 +98,7 @@ def _segment_from_step(
             raise ValueError("talk step requires talk context")
         seg = Segment(
             source=current_talk.source_file,
+            source_chunks=current_talk.source_chunks,
             trim_start=current_talk.start_time,
             trim_end=current_talk.end_time,
             audio="source",

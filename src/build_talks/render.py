@@ -20,6 +20,7 @@ from build_talks.config import (
     SAMPLE_RATE,
 )
 from build_talks.ffmpeg import (
+    concat_list_file,
     duration_str,
     normalize_video_filter,
     run,
@@ -38,6 +39,7 @@ def build_filtergraph(
     pairs: list[tuple[Segment, Path]],
     vcodec: str,
     output: Path,
+    cache: Path,
 ) -> tuple[list[str], int]:
     """
     Build the full ffmpeg command for assembling the final video.
@@ -45,6 +47,7 @@ def build_filtergraph(
     pairs   -- list of (Segment, prepared_path) in timeline order
     vcodec  -- encoder choice (passed through to vcodec_flags)
     output  -- destination file for the assembled video
+    cache   -- cache directory used for concat list files
 
     Returns:
         cmd          -- complete ffmpeg command as a list of strings
@@ -60,7 +63,16 @@ def build_filtergraph(
     for seg, prepared in pairs:
         if seg.raw:
             # Seek at input level; the segment is trimmed to exactly trim_start→trim_end.
-            inputs += ["-ss", seg.trim_start, "-t", duration_str(seg.trim_start, seg.trim_end), "-i", str(seg.source)]
+            if seg.source_chunks:
+                concat_list = concat_list_file(seg.source_chunks, cache)
+                inputs += [
+                    "-f", "concat", "-safe", "0",
+                    "-ss", seg.trim_start,
+                    "-t", duration_str(seg.trim_start, seg.trim_end),
+                    "-i", str(concat_list),
+                ]
+            else:
+                inputs += ["-ss", seg.trim_start, "-t", duration_str(seg.trim_start, seg.trim_end), "-i", str(seg.source)]
         else:
             inputs += ["-i", str(prepared)]
         durations.append(seg_duration(seg, prepared))
@@ -181,7 +193,7 @@ def assemble(recipe: list[Segment], output: Path, vcodec: str, cache: Path) -> N
         return
 
     pairs = [(seg, prepare_segment(seg, cache, vcodec)) for seg in recipe]
-    cmd, total_us = build_filtergraph(pairs, vcodec, output)
+    cmd, total_us = build_filtergraph(pairs, vcodec, output, cache)
 
     log.info("[rendering] %s — %ds video", label, total_us // 1_000_000)
     t0 = time.monotonic()
